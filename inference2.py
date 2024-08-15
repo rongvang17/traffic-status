@@ -28,7 +28,7 @@ tracker = DeepOCSORT(
 )
 
 
-def draw_box(img, tracks, distance_cal, num_frame):
+def draw_box(img, tracks, distance_cal, num_frame, area_cal):
     global colors
     global class_names
     global roi_polygon
@@ -39,6 +39,7 @@ def draw_box(img, tracks, distance_cal, num_frame):
     num_bike = 0
     num_bus = 0
     num_truck = 0
+    avg_speed = 0
     xyxys = tracks[:, 0:4].astype('int')
     ids = tracks[:, 4].astype('int')
     conf = tracks[:, 5]
@@ -73,6 +74,7 @@ def draw_box(img, tracks, distance_cal, num_frame):
                     track_object[ids[idx]] = [new_distance, his_fram, object_speed]
 
                 if object_speed != -1:
+                    avg_speed += (object_speed/len(track_object))
                     cv2.putText(img, "%.2f" % (object_speed), (left + 5, top - 8), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[clss[idx]], 2)
                                     
             else:
@@ -94,6 +96,12 @@ def draw_box(img, tracks, distance_cal, num_frame):
             label = "{}".format(text_ids)
             cv2.rectangle(img, (left, top), (right, bottom), colors[text_clss], 2)
             # cv2.putText(img, label, (left + 5, top - 8), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[text_clss], 2)
+
+    occupancies = area_cal(num_car, num_bike, num_bus, num_truck)
+    if avg_speed < 5 and occupancies > 0.8:
+        cv2.putText(img, 'TAC DUONG', (350, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+    else:
+        cv2.putText(img, 'KHONG TAC', (350, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
 
     cv2.putText(img, 'num_car:{}'.format(num_car), (630, 130), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[0], 2)
     cv2.putText(img, 'num_bike:{}'.format(num_bike), (630, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[1], 2)
@@ -208,9 +216,13 @@ def speed_estimation(fps=30):
     return lambda x, y, y_: 3.6 * fps * abs(x) / (y_ - y)
 
 
+def occupancy_estimation(car, bike, bus, truck, area):
+    return lambda x, y, z, h: (x * car + y * bike + z * bus + h * truck) / area
+
+
 def main(_argv):
 
-    video_path = '/home/minhthanh/Downloads/a7_non_hd_front_normal_23s.mp4'
+    video_path = '/home/minhthanh/Downloads/video1_2.mp4'
     vid = cv2.VideoCapture(video_path)
     width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -238,6 +250,9 @@ def main(_argv):
     global speed_function
     speed_function = speed_estimation(fps=fps)
     num_frame = 0
+
+    true_area = left_area + right_area
+    area_cal = occupancy_estimation(15, 3, 40, 60, true_area)
 
     while True:
         ret, frame = vid.read()
@@ -282,7 +297,7 @@ def main(_argv):
 
         # tracker.plot_results(im, show_trajectories=True) # auto draw object
         if (tracks is not None) and (len(tracks)>0):
-            draw_box(frame, tracks, distance_cal, num_frame)
+            draw_box(frame, tracks, distance_cal, num_frame, area_cal)
 
         # break on pressing q or space
         cv2.imshow('BoxMOT detection', frame)
