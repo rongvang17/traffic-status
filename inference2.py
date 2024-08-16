@@ -9,15 +9,19 @@ from pathlib import Path
 from absl import app, flags
 from absl.flags import FLAGS
 from shapely.geometry import Point, Polygon
+from collections import defaultdict, deque
 # from models.common import DetectMultiBackend, AutoShape
 
 flags.DEFINE_string('ccfg', './cfg/cfg2.txt', 'path to camera config file')
 
 # detection model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = torch.hub.load("yolov5", "custom", path="/home/minhthanh/directory_env/object_tracking/yolov5/weights/best.pt", source="local")  # local repo
+model = torch.hub.load("yolov5", "custom",
+                       path="/home/minhthanh/directory_env/object_tracking/yolov5/weights/best.pt",
+                       source="local")  # local repo
 model.conf = 0.4
 model.max_det = 1000
+model.eval()
 # model.cuda()
 
 # tracking model
@@ -26,6 +30,113 @@ tracker = DeepOCSORT(
     device='cpu',
     fp16=False,
 )
+
+
+class ViewTransformer:
+    def __init__(self, source: np.ndarray, target: np.ndarray) -> None:
+        source = source.astype(np.float32)
+        target = target.astype(np.float32)
+        self.m = cv2.getPerspectiveTransform(source, target)
+
+    def transform_points(self, points: np.ndarray) -> np.ndarray:
+        if len(points) == 0:
+            return points
+
+        reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
+        transformed_points = cv2.perspectiveTransform(
+                reshaped_points, self.m)
+        return transformed_points.reshape(-1, 2)
+
+
+# Perspective Transformation
+def draw_box_2(
+        img,
+        tracks,
+        distance_cal,
+        num_frame,
+        area_cal,
+        SOURCE,
+        TARGET
+):
+    global colors
+    global class_names
+    global roi_polygon
+    global track_object
+    global speed_function
+    global fps
+    global coordinates
+    xyxys = tracks[:, 0:4].astype('int')
+    ids = tracks[:, 4].astype('int')
+    conf = tracks[:, 5]
+    clss = tracks[:, 6].astype('int')
+    inds = tracks[:, 7].astype('int') # float64 to int
+    num_car = 0
+    num_bike = 0
+    num_bus = 0
+    num_truck = 0
+    avg_speed = 0
+
+    view_transformer = ViewTransformer(source=SOURCE, target=TARGET)
+
+    for idx in range(tracks.shape[0]):
+        left , top, right, bottom = xyxys[idx]
+        x_center, y_center = (left + right) / 2, (top + bottom) / 2
+        point = Point(x_center, y_center)
+        is_inside = roi_polygon.contains(point)
+
+        if is_inside:
+
+            # plug the view transformer into an existing detection pipeline
+            coord_object = []
+            coord_object.append((x_center, y_center))
+            coord_object = np.array(coord_object)
+            points = view_transformer.transform_points(points=coord_object).astype(int)
+
+            # store the transformed coordinates
+            coordinates[ids[idx]].append((points[0][0], points[0][1], num_frame, -1))
+            
+            # wait to have enough data
+            if len(coordinates[ids[idx]]) >= (6*fps):
+                # calculate the speed
+                coordinate_start = coordinates[ids[idx]][-1]
+                coordinate_end = coordinates[ids[idx]][2*fps]
+                distance = ((coordinate_start[0] - coordinate_end[0])**2 + 
+                            (coordinate_start[1] - coordinate_end[1])**2)**0.5
+                eta = abs(coordinate_start[2] - coordinate_end[2])
+                if (eta%(2 * fps)==2) and distance>=2.5:
+                    time = float(abs(eta) / fps)
+                    speed = (distance / time) * 3.6
+                    coordinates[ids[idx]][3] = speed
+                    avg_speed += (speed / len(tracks))
+                if coordinates[ids[idx]][3] != -1:
+                    cv2.putText(img, "{:.2f}".format(coordinates[ids[idx]][3]), (left + 2, top - 2), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, colors[clss[idx]], 2)
+                # cv2.putText(img, "{}_{}".format(points[0][0], points[0][1]), 
+                #             (left + 2, top - 2), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[clss[idx]], 2)
+
+            text_conf = conf[idx]
+            text_clss = clss[idx]
+            text_ids = ids[idx]
+            # text_inds = inds[idx]
+            if text_clss == 0:
+                num_car += 1
+            if text_clss == 1:
+                num_bike += 1
+            if text_clss == 2:
+                num_bus += 1
+            if text_clss == 3:
+                num_truck += 1
+
+            cv2.rectangle(img, (left, top), (right, bottom), colors[clss[idx]], 2)
+    
+    occupancies = area_cal(num_car, num_bike, num_bus, num_truck)
+    if avg_speed < 5 and occupancies > 0.85:
+        cv2.putText(img, 'TAC DUONG', (350, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+    else:
+        cv2.putText(img, 'KHONG TAC', (350, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
+
+    # cv2.putText(img, 'num_bus:{}'.format(num_bus), (600, 65), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[2], 2)
+    # cv2.putText(img, 'num_truck:{}'.format(num_truck), (600, 85), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[3], 2)    
 
 
 def draw_box(img, tracks, distance_cal, num_frame, area_cal):
@@ -75,7 +186,8 @@ def draw_box(img, tracks, distance_cal, num_frame, area_cal):
 
                 if object_speed != -1:
                     avg_speed += (object_speed/len(track_object))
-                    cv2.putText(img, "%.2f" % (object_speed), (left + 5, top - 8), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[clss[idx]], 2)
+                    cv2.putText(img, "%.2f" % (object_speed), (left + 5, top - 8), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, colors[clss[idx]], 2)
                                     
             else:
                 track_object[ids[idx]] = [-1, num_frame, -1]
@@ -109,7 +221,6 @@ def draw_box(img, tracks, distance_cal, num_frame, area_cal):
     # cv2.putText(img, 'num_truck:{}'.format(num_truck), (600, 85), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[3], 2)    
 
 
-
 def get_pixel(rw, ppa, aw, delta, rh, vh, vw, diameter,  isLeft = False):
     # rw = 1.1*rw
     alpha = (180 / math.pi) * math.acos(rh * math.tan(aw) / rw)
@@ -140,7 +251,17 @@ def get_pixel(rw, ppa, aw, delta, rh, vh, vw, diameter,  isLeft = False):
     return (point, (x / vw, (vh - top_px) / vh))
 
 
-def get_roi_points(touch_angle, h_angle, real_height, left_real_width, right_real_width, width, height, diameter, ppa):
+def get_roi_points(
+    touch_angle, 
+    h_angle, 
+    real_height, 
+    left_real_width, 
+    right_real_width, 
+    width, 
+    height, 
+    diameter,
+    ppa
+):
     width_angle = h_angle * math.pi / 180
     point_left = get_pixel(left_real_width, ppa, width_angle, touch_angle, real_height, height, width, diameter, True)
     point_right = get_pixel(right_real_width, ppa, width_angle, touch_angle, real_height, height, width, diameter,
@@ -170,7 +291,7 @@ def read_ccfg(height, width, diameter):
     file_path = FLAGS.ccfg
     file_path = './cfg/cfg.txt'
 
-    print('use camera config file: ' + file_path)
+    # print('use camera config file: ' + file_path)
     with open(file_path, 'r') as f:
       data = [float(i.strip()) for i in f.readlines()]
 
@@ -222,6 +343,7 @@ def occupancy_estimation(car, bike, bus, truck, area):
 
 def main(_argv):
 
+    # video_path = '/home/minhthanh/Downloads/a7_non_hd_front_normal_23s.mp4'
     video_path = '/home/minhthanh/Downloads/video1_2.mp4'
     vid = cv2.VideoCapture(video_path)
     width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -239,6 +361,7 @@ def main(_argv):
     diameter = 30
     distance_cal, roi_points, left_area, right_area = read_ccfg(height, width, diameter)
     roi_points, raw_rois = region_of_interested(roi_points, width, height)
+    # print(roi_points)
     top, bottom, right, left = search_pivot(roi_points)
     global roi_polygon
     roi_polygon = Polygon(roi_points)
@@ -251,16 +374,26 @@ def main(_argv):
     speed_function = speed_estimation(fps=fps)
     num_frame = 0
 
+    # save object information in 4s (x, y, frame)
+    global coordinates
+    coordinates = defaultdict(lambda: deque(maxlen=6*fps))
+
     true_area = left_area + right_area
     area_cal = occupancy_estimation(15, 3, 40, 60, true_area)
+
+    SOURCE = [roi_points[i] for i in range(4)]
+    SOURCE = np.array(SOURCE)
+
+    # setup manual --> can auto
+    TARGET = np.array([[0, 19],
+                        [0, 0],
+                        [11, 0],
+                        [11, 19]])
 
     while True:
         ret, frame = vid.read()
         if not ret:
             break
-
-        # for index in range(len(roi_points) - 1):
-        #     cv2.line(frame, roi_points[index], roi_points[index + 1], (0, 0, 255), 2)
 
         pts = np.array(roi_points, np.int32)
         pts = pts.reshape((-1, 1, 2))
@@ -297,7 +430,8 @@ def main(_argv):
 
         # tracker.plot_results(im, show_trajectories=True) # auto draw object
         if (tracks is not None) and (len(tracks)>0):
-            draw_box(frame, tracks, distance_cal, num_frame, area_cal)
+            # draw_box(frame, tracks, distance_cal, num_frame, area_cal)
+            draw_box_2(frame, tracks, distance_cal, num_frame, area_cal, SOURCE, TARGET)
 
         # break on pressing q or space
         cv2.imshow('BoxMOT detection', frame)
