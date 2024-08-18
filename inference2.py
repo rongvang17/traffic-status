@@ -96,20 +96,23 @@ def draw_box_2(
             coordinates[ids[idx]].append((points[0][0], points[0][1], num_frame, -1))
             
             # wait to have enough data
-            if len(coordinates[ids[idx]]) >= (6*fps):
+            if len(coordinates[ids[idx]]) >= (4*fps):
                 # calculate the speed
                 coordinate_start = coordinates[ids[idx]][-1]
                 coordinate_end = coordinates[ids[idx]][2*fps]
                 distance = ((coordinate_start[0] - coordinate_end[0])**2 + 
                             (coordinate_start[1] - coordinate_end[1])**2)**0.5
                 eta = abs(coordinate_start[2] - coordinate_end[2])
-                if (eta%(2 * fps)==2) and distance>=2.5:
+                if distance>=0.5:
                     time = float(abs(eta) / fps)
                     speed = (distance / time) * 3.6
-                    coordinates[ids[idx]][3] = speed
+                    vex = coordinates[ids[idx]]
+                    coordinates[ids[idx]][-1] = (points[0][0], points[0][1], num_frame, speed)
                     avg_speed += (speed / len(tracks))
-                if coordinates[ids[idx]][3] != -1:
-                    cv2.putText(img, "{:.2f}".format(coordinates[ids[idx]][3]), (left + 2, top - 2), 
+                vex = coordinates[ids[idx]][-1]
+                check_speed = vex[3]
+                if int(check_speed) != -1:
+                    cv2.putText(img, "{:.2f}".format(check_speed), (left + 2, top - 2), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, colors[clss[idx]], 2)
                 # cv2.putText(img, "{}_{}".format(points[0][0], points[0][1]), 
                 #             (left + 2, top - 2), cv2.FONT_HERSHEY_SIMPLEX, 1, colors[clss[idx]], 2)
@@ -376,7 +379,7 @@ def main(_argv):
 
     # save object information in 4s (x, y, frame)
     global coordinates
-    coordinates = defaultdict(lambda: deque(maxlen=6*fps))
+    coordinates = defaultdict(lambda: deque(maxlen=4*fps))
 
     true_area = left_area + right_area
     area_cal = occupancy_estimation(15, 3, 40, 60, true_area)
