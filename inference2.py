@@ -14,8 +14,6 @@ from collections import defaultdict, deque
 
 # from models.common import DetectMultiBackend, AutoShape
 
-flags.DEFINE_string('ccfg', './cfg/cfg2.txt', 'Path to camera config file')
-
 # Detection model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = torch.hub.load(
