@@ -4,6 +4,8 @@ import torch
 import json
 import math
 import time
+import threading
+import easyocr
 
 from boxmot import DeepOCSORT
 from pathlib import Path
@@ -15,6 +17,9 @@ from collections import defaultdict, deque
 # from models.common import DetectMultiBackend, AutoShape
 
 flags.DEFINE_string('ccfg', './cfg/cfg2.txt', 'Path to camera config file')
+
+# read text by use Easyocr
+reader = easyocr.Reader(['en', 'vi'], gpu=False)
 
 # Detection model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -35,6 +40,60 @@ tracker = DeepOCSORT(
     device='cpu',
     fp16=False,
 )
+
+# license plate detection model
+yolo_LP_detect = torch.hub.load(
+    'yolov5',
+    'custom', 
+    path='home/minhthanh/code_python/bien_so_xe/model/LP_detector_nano_61.pt', 
+    force_reload=True, 
+    source='local')
+yolo_LP_detect.eval()
+
+# license plate recognition model
+yolo_license_plate = torch.hub.load(
+    'yolov5', 
+    'custom', 
+    path='/home/minhthanh/code_python/bien_so_xe/model/LP_ocr_nano_62.pt', 
+    force_reload=True, 
+    source='local')
+yolo_license_plate.eval()
+
+
+def detection_recognition_plate(frame):
+    copy_img = frame
+    plates = yolo_LP_detect(copy_img, size=832)
+    data = plates.pandas().xyxy[0].to_json(orient="records")
+    json_data = json.loads(data)
+
+    if not json_data:
+        return
+
+    detect = []
+    for record in json_data:
+        confidence = round(record['confidence'], 2)
+        class_id = record['class']
+        left = int(record['xmin'])
+        top = int(record['ymin'])
+        right = int(record['xmax'])
+        bottom = int(record['ymax'])
+        crop_image = copy_img[top:bottom, left:right]
+        cv2.rectangle(frame, (left, top), (right, bottom), (0, 177, 255), 2)
+
+        result = reader.readtext(crop_image, detail=1, paragraph=True)
+        if len(result)>0:
+            for _, text in result:
+                text_detection = text
+            
+            cv2.putText(
+                frame, 
+                str(text), 
+                (left+2, top-2), 
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 177, 255),
+                1,
+            )
 
 
 class ViewTransformer:
@@ -312,7 +371,8 @@ def draw_box_2(
             cv2.rectangle(img, (left, top), (right, bottom), colors[clss[idx]], 2)
 
     occupancies = area_cal(num_car, num_bike, num_bus, num_truck)
-    if avg_speed < 5 and occupancies > 0.9:
+    # speed < 5 and occupancies > 95% --> congestion
+    if avg_speed < 5 and occupancies > 0.95:
         cv2.putText(img, 'fps:{}'.format(fps), (350, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
         cv2.putText(img, 'tac duong', (350, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
     else:
@@ -432,6 +492,7 @@ def main():
     cv2.createTrackbar('base_angle', 'image', 0, 180, nothing)
     cv2.createTrackbar('delta_angle', 'image', 0, 180, nothing)
     cv2.createTrackbar('h_angle', 'image', 0, 180, nothing)
+    cv2.createTrackbar('diameter', 'image', 30, 100, nothing)
 
     while True:
         
@@ -443,6 +504,7 @@ def main():
 
         try:
             diameter = 30
+            # diameter = cv2.createTrackbar('diameter', 'image', 30, 100, nothing)
             distance_cal, roi_points, left_area, right_area = read_ccfg(height, width, diameter)
             roi_points, raw_rois = region_of_interested(roi_points, width, height)
             top, bottom, right, left = search_pivot(roi_points)
@@ -452,12 +514,13 @@ def main():
             area_cal = occupancy_estimation(13, 3, 40, 60, true_area)
 
 
-            real_height = cv2.getTrackbarPos('real_height', 'image') 
+            real_height = cv2.getTrackbarPos('real_height', 'image')
             left_width = cv2.getTrackbarPos('left_width', 'image')
             right_width = cv2.getTrackbarPos('right_width', 'image')
-            base_angle = cv2.getTrackbarPos('base_angle', 'image') 
+            base_angle = cv2.getTrackbarPos('base_angle', 'image')
             delta_angle = cv2.getTrackbarPos('delta_angle', 'image')
             h_angle = cv2.getTrackbarPos('h_angle', 'image')
+            # diameter = cv2.createTrackbar('diameter', 'image', 0, 100, nothing)
 
 
             pts = np.array(roi_points, np.int32).reshape((-1, 1, 2))
@@ -471,7 +534,7 @@ def main():
 
             # real_height = data[0]
             # left_width = data[1]
-            # right_width = data[2] 
+            # right_width = data[2]
             # base_angle = data[3]
             # delta_angle = data[4]
             # h_angle = data[5]
@@ -482,6 +545,7 @@ def main():
             cv2.putText(frame, "base_angle:{}".format(base_angle), (450, 115), cv2.FONT_HERSHEY_DUPLEX, 1, 0, 1)
             cv2.putText(frame, "delta_angle:{}".format(delta_angle), (450, 140), cv2.FONT_HERSHEY_DUPLEX, 1, 0, 1)
             cv2.putText(frame, "h_angle:{}".format(h_angle), (450, 165), cv2.FONT_HERSHEY_DUPLEX, 1, 0, 1)
+            cv2.putText(frame, "diameter:{}".format(diameter), (450, 190), cv2.FONT_HERSHEY_DUPLEX, 1, 0, 1)
 
             # Inference detection
             # frame = cv2.resize(frame, (1024, 1024))
@@ -514,8 +578,17 @@ def main():
                 tracks = tracker.update(detect, frame)  # M x (x, y, x, y, id, conf, cls, ind)
 
             if tracks is not None and len(tracks) > 0:
-                draw_box(frame, tracks, distance_cal, num_frame, area_cal)
+                # draw_box(frame, tracks, distance_cal, num_frame, area_cal)
                 # draw_box_2(frame, tracks, distance_cal, num_frame, area_cal, SOURCE, TARGET)
+                thread_1 = threading.Thread(target=draw_box, args=(frame, tracks, distance_cal, num_frame, area_cal))
+                thread_2 = threading.Thread(target=detection_recognition_plate, args=(frame,))
+
+                thread_1.start()
+                thread_2.start()
+
+                thread_1.join()
+                thread_2.join()
+
         except:
             pass
 
